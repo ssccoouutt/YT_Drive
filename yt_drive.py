@@ -2,10 +2,10 @@ import os
 import logging
 import re
 import base64
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -31,6 +31,10 @@ logging.basicConfig(
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
+
+# Ensure downloads directory exists
+if not os.path.exists('downloads'):
+    os.makedirs('downloads')
 
 # Create credentials.json from environment variable
 if GOOGLE_CREDENTIALS and not os.path.exists(CLIENT_SECRET_FILE):
@@ -67,7 +71,7 @@ async def download_youtube_video(url, update: Update):
         'outtmpl': os.path.join('downloads', '%(title)s.%(ext)s'),  # Save to downloads directory
         'cookiefile': COOKIES_FILE,  # Use cookies.txt for age-restricted videos
         'quiet': True,  # Suppress yt-dlp output
-        'progress_hooks': [partial(progress_hook, update=update)],  # Add progress hook
+        'progress_hooks': [lambda d: asyncio.create_task(progress_hook(d, update))],  # Add progress hook
     }
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -85,14 +89,14 @@ async def download_youtube_video(url, update: Update):
         
     return file_path, title, duration, size, thumbnail_path
 
-def progress_hook(d, update: Update):
+async def progress_hook(d, update: Update):
     """Progress hook for yt-dlp to update download progress"""
     if d['status'] == 'downloading':
         percent = d.get('_percent_str', '0%')
         speed = d.get('_speed_str', 'N/A')
         eta = d.get('_eta_str', 'N/A')
         message = f"⬇️ Downloading...\nProgress: {percent}\nSpeed: {speed}\nETA: {eta}"
-        update.message.reply_text(message)
+        await update.message.reply_text(message)
 
 async def upload_to_google_drive(file_path, file_name, update: Update):
     """Upload file to Google Drive with progress updates"""
@@ -124,6 +128,8 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         await update.message.reply_text("⬇️ Downloading video...")
+        await asyncio.sleep(1)  # Add a small delay
+
         file_path, title, duration, size, thumbnail_path = await download_youtube_video(url, update)
 
         # Send video details
@@ -135,12 +141,14 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"📦 <b>Size:</b> {size_mb:.2f} MB\n"
         )
         await update.message.reply_text(details_message, parse_mode='HTML')
+        await asyncio.sleep(1)  # Add a small delay
 
         # Send thumbnail
         if os.path.exists(thumbnail_path):
             with open(thumbnail_path, 'rb') as thumb:
                 await update.message.reply_photo(photo=thumb)
             os.remove(thumbnail_path)
+        await asyncio.sleep(1)  # Add a small delay
 
         await update.message.reply_text("⬆️ Uploading to Google Drive...")
         file_id = await upload_to_google_drive(file_path, f"{title}.mp4", update)
@@ -151,7 +159,8 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
             await update.message.reply_text("❌ Failed to upload to Google Drive.")
 
         # Clean up downloaded file
-        os.remove(file_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
         logger.error(f"Error in handle_youtube_link: {e}")
