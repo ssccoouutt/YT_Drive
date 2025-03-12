@@ -4,6 +4,7 @@ import re
 import tempfile
 import json
 import base64
+import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from google.oauth2.credentials import Credentials
@@ -24,14 +25,13 @@ SCOPES = ['https://www.googleapis.com/auth/drive']
 
 # Load environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-GOOGLE_CREDENTIALS_BASE64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")  # Base64-encoded credentials
-COOKIES_FILE = "cookies.txt"  # Assuming cookies.txt is in the root directory
+GOOGLE_CREDENTIALS_BASE64 = os.getenv("GOOGLE_CREDENTIALS_BASE64")
+COOKIES_FILE = "cookies.txt"
 
 def authorize_google_drive():
     """Authorize Google Drive API using credentials from base64-encoded environment variable"""
     creds = None
     if GOOGLE_CREDENTIALS_BASE64:
-        # Decode the base64-encoded credentials
         creds_json = base64.b64decode(GOOGLE_CREDENTIALS_BASE64).decode('utf-8')
         creds_data = json.loads(creds_json)
         creds = Credentials.from_authorized_user_info(creds_data, SCOPES)
@@ -40,17 +40,26 @@ def authorize_google_drive():
     return creds
 
 async def download_youtube_video(url):
-    """Download YouTube video using yt-dlp"""
+    """Download YouTube video using yt-dlp with retry logic"""
     ydl_opts = {
-        'format': 'best',  # Download the best quality available
-        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),  # Save to temp directory
-        'cookiefile': COOKIES_FILE,  # Use cookies.txt for age-restricted videos
-        'quiet': True,  # Suppress yt-dlp output
+        'format': 'best',
+        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
+        'cookiefile': COOKIES_FILE,
+        'quiet': False,  # Enable verbose logging
     }
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        file_path = ydl.prepare_filename(info)
-    return file_path, info['title']
+    retries = 3
+    for attempt in range(retries):
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+                file_path = ydl.prepare_filename(info)
+                return file_path, info['title']
+        except Exception as e:
+            logger.warning(f"Attempt {attempt + 1} failed: {e}")
+            if attempt < retries - 1:
+                time.sleep(5)  # Wait before retrying
+            else:
+                raise
 
 async def upload_to_google_drive(file_path, file_name):
     """Upload file to Google Drive"""
