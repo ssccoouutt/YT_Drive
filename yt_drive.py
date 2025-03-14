@@ -4,6 +4,8 @@ import re
 import tempfile
 import base64
 import requests
+import yt_dlp
+import asyncio
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from google.oauth2.credentials import Credentials
@@ -11,7 +13,6 @@ from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
-from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -53,7 +54,7 @@ def authorize_google_drive():
             raise Exception("Google Drive authorization required.")
     return creds
 
-async def download_youtube_video(url):
+async def download_youtube_video(url, message):
     """Download YouTube video using yt-dlp."""
     ydl_opts = {
         'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Best quality MP4
@@ -61,10 +62,11 @@ async def download_youtube_video(url):
         'quiet': True,  # Suppress output
         'retries': 10,  # Retry up to 10 times
         'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,  # Use cookies.txt if available
+        'progress_hooks': [lambda d: asyncio.create_task(download_progress(d, message))],  # Hook to show real-time progress
     }
 
     try:
-        with YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             file_path = ydl.prepare_filename(info)
             file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
@@ -73,6 +75,15 @@ async def download_youtube_video(url):
     except Exception as e:
         logger.error(f"Failed to download YouTube video: {e}")
         raise
+
+async def download_progress(d, message):
+    """Handle real-time download progress."""
+    if d['status'] == 'downloading':
+        percentage = d.get('downloaded_bytes', 0) / d.get('total_bytes', 1) * 100
+        if int(percentage) % 10 == 0:  # Update every 10% to avoid too many edits
+            await message.edit_text(f"Download progress: {percentage:.2f}%")
+    elif d['status'] == 'finished':
+        await message.edit_text("Download complete, processing file...")
 
 async def upload_to_google_drive(file_path, file_name):
     """Upload file to Google Drive."""
@@ -96,10 +107,14 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        await update.message.reply_text("⬇️ Downloading YouTube video...")
-        file_path, title = await download_youtube_video(url)
+        # Send the initial message and keep it for updates
+        message = await update.message.reply_text("⬇️ Downloading YouTube video...")
 
-        await update.message.reply_text("⬆️ Uploading to Google Drive...")
+        # Download the video
+        file_path, title = await download_youtube_video(url, message)
+
+        # Upload the video to Google Drive
+        await message.edit_text("⬆️ Uploading to Google Drive...")
         drive_file_id = await upload_to_google_drive(file_path, f"{title}.mp4")
 
         if drive_file_id:
