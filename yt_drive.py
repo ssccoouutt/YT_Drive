@@ -1,15 +1,16 @@
 import os
 import logging
 import re
-import requests
+import tempfile
 import base64
+import requests
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
+from yt_dlp import YoutubeDL
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -19,8 +20,9 @@ load_dotenv()
 SCOPES = ['https://www.googleapis.com/auth/drive']
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # From Railway environment
 GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')  # Base64 encoded credentials
-CLIENT_SECRET_FILE = 'credentials.json'  # Will be created from environment variable
-TOKEN_FILE = 'token.json'  # Will be stored in Railway's ephemeral storage
+CLIENT_SECRET_FILE = 'credentials.json'  # Created from environment variable
+TOKEN_FILE = 'token.json'  # Stored in Railway's ephemeral storage
+COOKIES_FILE = 'cookies.txt'  # Directly reference the file in the repository
 
 # Initialize logging
 logging.basicConfig(
@@ -50,8 +52,28 @@ def authorize_google_drive():
             raise Exception("Google Drive authorization required.")
     return creds
 
-def upload_to_google_drive(file_path, file_name):
-    """Upload a file to Google Drive."""
+async def download_youtube_video(url):
+    """Download YouTube video using yt-dlp."""
+    ydl_opts = {
+        'format': 'best',  # Best quality
+        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
+        'quiet': True,  # Suppress output
+    }
+    
+    # Add cookies.txt if it exists in the repository
+    if os.path.exists(COOKIES_FILE):
+        ydl_opts['cookiefile'] = COOKIES_FILE
+        logger.info("Using cookies.txt for YouTube download")
+    else:
+        logger.warning("cookies.txt not found. Proceeding without cookies.")
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        file_path = ydl.prepare_filename(info)
+    return file_path, info['title']
+
+async def upload_to_google_drive(file_path, file_name):
+    """Upload file to Google Drive."""
     creds = authorize_google_drive()
     service = build('drive', 'v3', credentials=creds)
     file_metadata = {'name': file_name}
@@ -59,53 +81,9 @@ def upload_to_google_drive(file_path, file_name):
     file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
     return file.get('id')
 
-def start(update: Update, context: CallbackContext) -> None:
-    """Handler for the /start command."""
-    update.message.reply_text("Send me a direct download link, and I'll upload it to your Google Drive!")
-
-def handle_authorization_code(update: Update, context: CallbackContext) -> None:
-    """Handle the authorization code from the user."""
-    code = update.message.text.strip()
-    try:
-        flow = Flow.from_client_secrets_file(
-            CLIENT_SECRET_FILE,
-            scopes=SCOPES,
-            redirect_uri='urn:ietf:wg:oauth:2.0:oob'
-        )
-        flow.fetch_token(code=code)
-        with open(TOKEN_FILE, 'w') as token_file:
-            token_file.write(flow.credentials.to_json())
-        update.message.reply_text("✅ Authorization successful! You can now send direct download links.")
-    except Exception as e:
-        update.message.reply_text(f"❌ Authorization failed. Please try again. Error: {str(e)}")
-        logger.error(f"Authorization error: {e}")
-
-def handle_document_link(update: Update, context: CallbackContext) -> None:
-    """Handler for direct download links."""
+async def handle_direct_download_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle direct download links."""
     url = update.message.text
-
-    # Validate the URL
-    if not url.startswith(("http://", "https://")):
-        update.message.reply_text("Please send a valid direct download link.")
-        return
-
-    try:
-        # Check if Google Drive is authorized
-        creds = authorize_google_drive()
-    except Exception as e:
-        # If not authorized, start the OAuth2 flow
-        flow = Flow.from_client_secrets_file(
-            CLIENT_SECRET_FILE,
-            scopes=SCOPES,
-            redirect_uri='urn:ietf:wg:oauth:2.0:oob'
-        )
-        auth_url, _ = flow.authorization_url(prompt='consent')
-        update.message.reply_text(
-            f"🔑 Authorization required!\n\n"
-            f"Please visit this link to authorize:\n{auth_url}\n\n"
-            "After authorization, send the code you receive back here."
-        )
-        return
 
     try:
         # Download the file
@@ -121,44 +99,63 @@ def handle_document_link(update: Update, context: CallbackContext) -> None:
                 file.write(chunk)
 
         # Upload the file to Google Drive
-        drive_file_id = upload_to_google_drive(file_name, file_name)
-        update.message.reply_text(f"✅ File uploaded to Google Drive with ID: {drive_file_id}")
+        drive_file_id = await upload_to_google_drive(file_name, file_name)
+        await update.message.reply_text(f"✅ File uploaded to Google Drive with ID: {drive_file_id}")
 
         # Clean up the temporary file
         os.remove(file_name)
 
     except Exception as e:
-        update.message.reply_text(f"❌ Failed to process the file. Error: {str(e)}")
-        logger.error(f"File processing error: {e}")
+        await update.message.reply_text(f"❌ Failed to process the file. Error: {str(e)}")
+        logger.error(f"Direct download error: {e}")
 
-def handle_message(update: Update, context: CallbackContext) -> None:
+async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle YouTube links."""
+    url = update.message.text
+
+    try:
+        await update.message.reply_text("⬇️ Downloading YouTube video...")
+        file_path, title = await download_youtube_video(url)
+
+        await update.message.reply_text("⬆️ Uploading to Google Drive...")
+        drive_file_id = await upload_to_google_drive(file_path, f"{title}.mp4")
+
+        if drive_file_id:
+            await update.message.reply_text(f"✅ YouTube video uploaded to Google Drive with ID: {drive_file_id}")
+        else:
+            await update.message.reply_text("❌ Failed to upload to Google Drive.")
+
+        # Clean up downloaded file
+        os.remove(file_path)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+        logger.error(f"YouTube download error: {e}")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all incoming messages."""
     message_text = update.message.text.strip()
 
-    # Check if the message is an authorization code
-    if re.match(r'^[A-Za-z0-9_\-]+/[A-Za-z0-9_\-]+$', message_text):
-        handle_authorization_code(update, context)
+    # Check if the message is a YouTube link
+    if re.match(r'^(https?\:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+', message_text):
+        await handle_youtube_link(update, context)
     # Check if the message is a direct download link
     elif message_text.startswith(("http://", "https://")):
-        handle_document_link(update, context)
+        await handle_direct_download_link(update, context)
     else:
-        update.message.reply_text("Please send a valid direct download link or authorization code.")
+        await update.message.reply_text("⚠️ Please send a valid YouTube URL or direct download link.")
 
-def main() -> None:
-    """Start the Telegram bot."""
-    # Initialize the Telegram Bot
-    updater = Updater(TELEGRAM_BOT_TOKEN)
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle /start command."""
+    await update.message.reply_text(
+        "Send me a direct download link or a YouTube video link, and I'll upload it to your Google Drive!"
+    )
 
-    # Get the dispatcher to register handlers
-    dispatcher = updater.dispatcher
+def main():
+    """Start the bot."""
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
 
-    # Register command and message handlers
-    dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
-
-    # Start the Bot
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
