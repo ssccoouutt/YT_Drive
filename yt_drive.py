@@ -1,5 +1,6 @@
 import os
 import logging
+import re
 import requests
 import base64
 from telegram import Update
@@ -130,6 +131,19 @@ def handle_document_link(update: Update, context: CallbackContext) -> None:
         update.message.reply_text(f"❌ Failed to process the file. Error: {str(e)}")
         logger.error(f"File processing error: {e}")
 
+def handle_message(update: Update, context: CallbackContext) -> None:
+    """Handle all incoming messages."""
+    message_text = update.message.text.strip()
+
+    # Check if the message is an authorization code
+    if re.match(r'^[A-Za-z0-9_\-]+/[A-Za-z0-9_\-]+$', message_text):
+        handle_authorization_code(update, context)
+    # Check if the message is a direct download link
+    elif message_text.startswith(("http://", "https://")):
+        handle_document_link(update, context)
+    else:
+        update.message.reply_text("Please send a valid direct download link or authorization code.")
+
 def main() -> None:
     """Start the Telegram bot."""
     # Initialize the Telegram Bot
@@ -140,7 +154,7 @@ def main() -> None:
 
     # Register command and message handlers
     dispatcher.add_handler(CommandHandler("start", start))
-    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_document_link))
+    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, handle_message))
 
     # Start the Bot
     updater.start_polling()
