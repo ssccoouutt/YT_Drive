@@ -56,22 +56,23 @@ def authorize_google_drive():
 async def download_youtube_video(url):
     """Download YouTube video using yt-dlp."""
     ydl_opts = {
-        'format': 'best',  # Best quality
+        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Best quality MP4
         'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
         'quiet': True,  # Suppress output
+        'retries': 10,  # Retry up to 10 times
+        'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,  # Use cookies.txt if available
     }
-    
-    # Add cookies.txt if it exists in the repository
-    if os.path.exists(COOKIES_FILE):
-        ydl_opts['cookiefile'] = COOKIES_FILE
-        logger.info("Using cookies.txt for YouTube download")
-    else:
-        logger.warning("cookies.txt not found. Proceeding without cookies.")
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        file_path = ydl.prepare_filename(info)
-    return file_path, info['title']
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_path = ydl.prepare_filename(info)
+            file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
+            logger.info(f"Downloaded video: {file_path} ({file_size:.2f} MB)")
+            return file_path, info['title']
+    except Exception as e:
+        logger.error(f"Failed to download YouTube video: {e}")
+        raise
 
 async def upload_to_google_drive(file_path, file_name):
     """Upload file to Google Drive."""
@@ -81,6 +82,36 @@ async def upload_to_google_drive(file_path, file_name):
     media = MediaFileUpload(file_path, resumable=True)
     file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
     return file.get('id')
+
+async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle YouTube links."""
+    url = update.message.text
+
+    try:
+        # Check if Google Drive is authorized
+        creds = authorize_google_drive()
+    except Exception as e:
+        # If not authorized, start the OAuth2 flow
+        await start_authorization(update, context)
+        return
+
+    try:
+        await update.message.reply_text("⬇️ Downloading YouTube video...")
+        file_path, title = await download_youtube_video(url)
+
+        await update.message.reply_text("⬆️ Uploading to Google Drive...")
+        drive_file_id = await upload_to_google_drive(file_path, f"{title}.mp4")
+
+        if drive_file_id:
+            await update.message.reply_text(f"✅ YouTube video uploaded to Google Drive with ID: {drive_file_id}")
+        else:
+            await update.message.reply_text("❌ Failed to upload to Google Drive.")
+
+        # Clean up downloaded file
+        os.remove(file_path)
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+        logger.error(f"YouTube download error: {e}")
 
 async def start_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start the OAuth2 authorization flow."""
@@ -113,72 +144,6 @@ async def handle_authorization_code(update: Update, context: ContextTypes.DEFAUL
     except Exception as e:
         await update.message.reply_text(f"❌ Authorization failed. Please try again. Error: {str(e)}")
         logger.error(f"Authorization error: {e}")
-
-async def handle_direct_download_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle direct download links."""
-    url = update.message.text
-
-    try:
-        # Check if Google Drive is authorized
-        creds = authorize_google_drive()
-    except Exception as e:
-        # If not authorized, start the OAuth2 flow
-        await start_authorization(update, context)
-        return
-
-    try:
-        # Download the file
-        response = requests.get(url, stream=True)
-        response.raise_for_status()
-
-        # Get the file name from the URL or use a default name
-        file_name = url.split("/")[-1] or "downloaded_file"
-
-        # Save the file temporarily
-        with open(file_name, "wb") as file:
-            for chunk in response.iter_content(chunk_size=8192):
-                file.write(chunk)
-
-        # Upload the file to Google Drive
-        drive_file_id = await upload_to_google_drive(file_name, file_name)
-        await update.message.reply_text(f"✅ File uploaded to Google Drive with ID: {drive_file_id}")
-
-        # Clean up the temporary file
-        os.remove(file_name)
-
-    except Exception as e:
-        await update.message.reply_text(f"❌ Failed to process the file. Error: {str(e)}")
-        logger.error(f"Direct download error: {e}")
-
-async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle YouTube links."""
-    url = update.message.text
-
-    try:
-        # Check if Google Drive is authorized
-        creds = authorize_google_drive()
-    except Exception as e:
-        # If not authorized, start the OAuth2 flow
-        await start_authorization(update, context)
-        return
-
-    try:
-        await update.message.reply_text("⬇️ Downloading YouTube video...")
-        file_path, title = await download_youtube_video(url)
-
-        await update.message.reply_text("⬆️ Uploading to Google Drive...")
-        drive_file_id = await upload_to_google_drive(file_path, f"{title}.mp4")
-
-        if drive_file_id:
-            await update.message.reply_text(f"✅ YouTube video uploaded to Google Drive with ID: {drive_file_id}")
-        else:
-            await update.message.reply_text("❌ Failed to upload to Google Drive.")
-
-        # Clean up downloaded file
-        os.remove(file_path)
-    except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-        logger.error(f"YouTube download error: {e}")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all incoming messages."""
