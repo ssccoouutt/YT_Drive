@@ -38,7 +38,7 @@ def download_video(url, destination_folder):
         return None
 
 # Function to handle Google Drive authorization
-def authorize_google_drive(update: Update, context: CallbackContext):
+async def authorize_google_drive(update: Update, context: CallbackContext):
     try:
         # Decode the base64-encoded Google Credentials
         creds_json = base64.b64decode(GOOGLE_CREDENTIALS).decode('utf-8')
@@ -103,7 +103,7 @@ async def handle_youtube_link(update: Update, context: CallbackContext):
                 return
 
             # Authorize Google Drive
-            creds = authorize_google_drive(update, context)
+            creds = await authorize_google_drive(update, context)
             if not creds:
                 return  # Authorization is in progress
 
