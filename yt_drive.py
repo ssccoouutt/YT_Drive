@@ -1,198 +1,151 @@
 import os
-import logging
-import re
-import tempfile
-import base64
-import requests
+import subprocess
 import yt_dlp
 import asyncio
-from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
-from google.auth.transport.requests import Request
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload
-from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackContext
+from telegram.error import TelegramError
 
-# Load environment variables
-load_dotenv()
+# API Token for the bot (obtained from environment variable)
+API_TOKEN = os.environ.get('API_TOKEN')  # Fetch API_TOKEN from environment variable
 
-# Configuration
-SCOPES = ['https://www.googleapis.com/auth/drive']
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # From Railway environment
-GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')  # Base64 encoded credentials
-CLIENT_SECRET_FILE = 'credentials.json'  # Created from environment variable
-TOKEN_FILE = 'token.json'  # Stored in Railway's ephemeral storage
-COOKIES_FILE = 'cookies.txt'  # Directly reference the file in the repository
+# Telegram size limit (50 MB)
+TELEGRAM_MAX_SIZE_MB = 50
 
-# Initialize logging
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
-logger = logging.getLogger(__name__)
-
-# Create credentials.json from environment variable
-if GOOGLE_CREDENTIALS and not os.path.exists(CLIENT_SECRET_FILE):
-    try:
-        with open(CLIENT_SECRET_FILE, 'w') as f:
-            f.write(base64.b64decode(GOOGLE_CREDENTIALS).decode())
-    except Exception as e:
-        logger.error(f"Failed to create credentials.json: {e}")
-        raise
-
-def authorize_google_drive():
-    """Authorize Google Drive API using OAuth2."""
-    creds = None
-    if os.path.exists(TOKEN_FILE):
-        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            raise Exception("Google Drive authorization required.")
-    return creds
-
-async def download_youtube_video(url, message):
-    """Download YouTube video using yt-dlp."""
-    ydl_opts = {
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',  # Best quality MP4
-        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
-        'quiet': True,  # Suppress output
-        'retries': 10,  # Retry up to 10 times
-        'cookiefile': COOKIES_FILE if os.path.exists(COOKIES_FILE) else None,  # Use cookies.txt if available
-        'progress_hooks': [lambda d: asyncio.create_task(download_progress(d, message))],  # Hook to show real-time progress
-    }
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            file_path = ydl.prepare_filename(info)
-            file_size = os.path.getsize(file_path) / (1024 * 1024)  # Size in MB
-            logger.info(f"Downloaded video: {file_path} ({file_size:.2f} MB)")
-            return file_path, info['title']
-    except Exception as e:
-        logger.error(f"Failed to download YouTube video: {e}")
-        raise
-
+# Function to handle real-time download progress
 async def download_progress(d, message):
-    """Handle real-time download progress."""
     if d['status'] == 'downloading':
         percentage = d.get('downloaded_bytes', 0) / d.get('total_bytes', 1) * 100
+        # Update the progress by editing the same message
         if int(percentage) % 10 == 0:  # Update every 10% to avoid too many edits
             await message.edit_text(f"Download progress: {percentage:.2f}%")
     elif d['status'] == 'finished':
         await message.edit_text("Download complete, processing file...")
 
-async def upload_to_google_drive(file_path, file_name):
-    """Upload file to Google Drive."""
-    creds = authorize_google_drive()
-    service = build('drive', 'v3', credentials=creds)
-    file_metadata = {'name': file_name}
-    media = MediaFileUpload(file_path, resumable=True)
-    file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-    return file.get('id')
-
-async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle YouTube links."""
-    url = update.message.text
-
+# Function to download videos or audios (YouTube, Twitter/X, and TikTok)
+async def download_video(url, destination_folder, message, format="video"):
     try:
-        # Check if Google Drive is authorized
-        creds = authorize_google_drive()
-    except Exception as e:
-        # If not authorized, start the OAuth2 flow
-        await start_authorization(update, context)
-        return
-
-    try:
-        # Send the initial message and keep it for updates
-        message = await update.message.reply_text("⬇️ Downloading YouTube video...")
-
-        # Download the video
-        file_path, title = await download_youtube_video(url, message)
-
-        # Upload the video to Google Drive
-        await message.edit_text("⬆️ Uploading to Google Drive...")
-        drive_file_id = await upload_to_google_drive(file_path, f"{title}.mp4")
-
-        if drive_file_id:
-            await update.message.reply_text(f"✅ YouTube video uploaded to Google Drive with ID: {drive_file_id}")
+        # Determine the format
+        if format == "audio":
+            format_type = 'bestaudio/best'
+            ext = 'mp3'
         else:
-            await update.message.reply_text("❌ Failed to upload to Google Drive.")
+            format_type = 'best'
+            ext = 'mp4'
 
-        # Send the video to Telegram
-        await message.edit_text("⬆️ Sending video to Telegram...")
-        with open(file_path, "rb") as video_file:
-            await update.message.reply_video(video=InputFile(video_file))
+        # yt-dlp configuration with progress_hooks
+        options = {
+            'outtmpl': f'{destination_folder}/%(id)s.%(ext)s',  # Use the video ID to avoid filename issues
+            'format': format_type,  # Select the format based on user input
+            'restrictfilenames': True,  # Limit special characters
+            'progress_hooks': [lambda d: asyncio.create_task(download_progress(d, message))],  # Hook to show real-time progress
+        }
 
-        # Clean up downloaded file
-        os.remove(file_path)
+        # Download the video or audio
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.download([url])
+        return True
     except Exception as e:
-        await update.message.reply_text(f"❌ Error: {str(e)}")
-        logger.error(f"YouTube download error: {e}")
+        print(f"Error during download: {e}")
+        return False
 
-async def start_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start the OAuth2 authorization flow."""
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRET_FILE,
-        scopes=SCOPES,
-        redirect_uri='urn:ietf:wg:oauth:2.0:oob'
-    )
-    auth_url, _ = flow.authorization_url(prompt='consent')
-    context.user_data['flow'] = flow  # Store the flow object in user_data
-    await update.message.reply_text(
-        f"🔑 Authorization required!\n\n"
-        f"Please visit this link to authorize:\n{auth_url}\n\n"
-        "After authorization, send the code you receive back here."
-    )
-
-async def handle_authorization_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle the authorization code from the user."""
-    code = update.message.text.strip()
-    flow = context.user_data.get('flow')
-    if not flow:
-        await update.message.reply_text("❌ No active authorization session. Please send a link first.")
-        return
-
+# Function to reduce video quality if it's too large using ffmpeg
+def reduce_quality_ffmpeg(video_path, output_path, target_size_mb=50):
     try:
-        flow.fetch_token(code=code)
-        with open(TOKEN_FILE, 'w') as token_file:
-            token_file.write(flow.credentials.to_json())
-        await update.message.reply_text("✅ Authorization successful! You can now send links.")
+        # Command to reduce video quality using ffmpeg
+        command = [
+            'ffmpeg', '-i', video_path,
+            '-b:v', '500k',  # Adjust the video bitrate (can be modified as needed)
+            '-vf', 'scale=iw/2:ih/2',  # Reduce resolution by half
+            '-c:a', 'aac',  # Encode audio with AAC
+            '-b:a', '128k',  # Adjust the audio bitrate
+            output_path
+        ]
+
+        # Execute the ffmpeg command
+        subprocess.run(command, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Error reducing video quality with ffmpeg: {e}")
+        return False
+
+# Function to handle the /start command
+async def start(update: Update, context: CallbackContext):
+    await update.message.reply_text('Send a YouTube, Twitter/X, or TikTok link using /download <url>.\n'
+                                    'If the file is larger than 50 MB, the quality will be reduced to send it.')
+
+# Function to handle the /download command with format options
+async def download(update: Update, context: CallbackContext):
+    try:
+        # Extract the text sent after the command
+        message_text = update.message.text
+
+        # Check if the message contains a valid URL from YouTube, Twitter/X, or TikTok
+        if any(domain in message_text for domain in ["https://www.youtube.com/", "https://youtu.be/", "https://twitter.com/", "https://x.com/", "https://www.tiktok.com/"]):
+            params = message_text.split(" ")
+            url = params[1]  # Extract the URL after the command
+            format = "video" if len(params) < 3 or params[2].lower() != "audio" else "audio"
+            destination_folder = os.getenv('TEMP', '/tmp')  # Use the default temporary directory provided by Railway
+
+            # Send the initial message and keep it for updates
+            message = await update.message.reply_text(f'Starting the {format} download from: {url}')
+
+            # Start the download and update the same message
+            success_download = await download_video(url, destination_folder, message, format)
+
+            if not success_download:
+                await message.edit_text('Error during the video download. Please try again later.')
+                return
+
+            # Get the name of the downloaded file
+            video_filename = max([os.path.join(destination_folder, f) for f in os.listdir(destination_folder)], key=os.path.getctime)
+
+            # Check the file size
+            file_size_mb = os.path.getsize(video_filename) / (1024 * 1024)
+            if file_size_mb > TELEGRAM_MAX_SIZE_MB:
+                await message.edit_text(f'The file is too large ({file_size_mb:.2f} MB). '
+                                        f'Reducing the quality to meet the 50 MB limit...')
+
+                # Attempt to reduce the quality using ffmpeg
+                output_filename = os.path.join(destination_folder, 'compressed_' + os.path.basename(video_filename))
+                success_reduce = reduce_quality_ffmpeg(video_filename, output_filename, TELEGRAM_MAX_SIZE_MB)
+
+                if not success_reduce:
+                    await message.edit_text('Error reducing the video quality. Please try again later.')
+                    return
+
+                # Switch to the compressed file for sending
+                video_filename = output_filename
+
+            # Send the video/audio file to the user
+            await message.edit_text(f'Sending the {format}...')
+            try:
+                await update.message.reply_video(video=open(video_filename, 'rb'))
+            except TelegramError as e:
+                await message.edit_text(f'Error sending the file: {e}')
+                print(f"Error sending the file: {e}")
+            finally:
+                # Delete the downloaded file (optional)
+                if os.path.exists(video_filename):
+                    os.remove(video_filename)
+        else:
+            await update.message.reply_text('Please provide a valid YouTube, Twitter/X, or TikTok URL.')
+
     except Exception as e:
-        await update.message.reply_text(f"❌ Authorization failed. Please try again. Error: {str(e)}")
-        logger.error(f"Authorization error: {e}")
+        await update.message.reply_text('An unexpected error occurred. Please try again later.')
+        print(f"Error in the download function: {e}")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all incoming messages."""
-    message_text = update.message.text.strip()
-
-    # Check if the message is an authorization code
-    if re.match(r'^[A-Za-z0-9_\-]+/[A-Za-z0-9_\-]+$', message_text):
-        await handle_authorization_code(update, context)
-    # Check if the message is a YouTube link
-    elif re.match(r'^(https?\:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+', message_text):
-        await handle_youtube_link(update, context)
-    # Check if the message is a direct download link
-    elif message_text.startswith(("http://", "https://")):
-        await handle_direct_download_link(update, context)
-    else:
-        await update.message.reply_text("⚠️ Please send a valid YouTube URL, direct download link, or authorization code.")
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start command."""
-    await update.message.reply_text(
-        "Send me a direct download link or a YouTube video link, and I'll upload it to your Google Drive and Telegram!"
-    )
-
+# Main function to run the bot
 def main():
-    """Start the bot."""
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    # Create the bot using ApplicationBuilder
+    application = ApplicationBuilder().token(API_TOKEN).build()
 
-if __name__ == '__main__':
+    # Handled commands
+    application.add_handler(CommandHandler('start', start))
+    application.add_handler(CommandHandler('download', download))
+
+    # Start the bot
+    application.run_polling()
+
+if __name__ == "__main__":
     main()
