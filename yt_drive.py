@@ -20,6 +20,7 @@ TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')
 GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')
 CLIENT_SECRET_FILE = 'credentials.json'
 TOKEN_FILE = 'token.json'
+COOKIES_FILE = 'cookies.txt'  # Add cookies.txt support
 
 # Initialize logging
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
@@ -43,10 +44,28 @@ def authorize_google_drive():
     return creds
 
 async def download_youtube_video(url):
-    """Download YouTube video using yt-dlp."""
-    with YoutubeDL({'format': 'best', 'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s')}) as ydl:
-        info = ydl.extract_info(url, download=True)
-        return ydl.prepare_filename(info), info['title']
+    """Download YouTube video using yt-dlp with cookies support."""
+    ydl_opts = {
+        'format': 'best',
+        'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
+        'quiet': True,
+    }
+
+    # Add cookies.txt if it exists
+    if os.path.exists(COOKIES_FILE):
+        ydl_opts['cookiefile'] = COOKIES_FILE
+        logger.info("Using cookies.txt for YouTube download")
+    else:
+        logger.warning("cookies.txt not found. Proceeding without cookies.")
+
+    try:
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            file_path = ydl.prepare_filename(info)
+            return file_path, info['title']
+    except Exception as e:
+        logger.error(f"YouTube download failed: {e}")
+        raise
 
 async def upload_to_google_drive(file_path, file_name):
     """Upload file to Google Drive."""
