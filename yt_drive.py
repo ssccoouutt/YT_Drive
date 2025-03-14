@@ -5,6 +5,7 @@ import base64
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -40,8 +41,40 @@ def authorize_google_drive():
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
         else:
-            raise Exception("Google Drive authorization required.")
+            return None  # Authorization required
     return creds
+
+async def start_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start the OAuth2 authorization flow."""
+    flow = Flow.from_client_secrets_file(
+        CLIENT_SECRET_FILE,
+        scopes=SCOPES,
+        redirect_uri='urn:ietf:wg:oauth:2.0:oob'
+    )
+    auth_url, _ = flow.authorization_url(prompt='consent')
+    context.user_data['flow'] = flow  # Store the flow object in user_data
+    await update.message.reply_text(
+        f"🔑 Authorization required!\n\n"
+        f"Please visit this link to authorize:\n{auth_url}\n\n"
+        "After authorization, send the code you receive back here."
+    )
+
+async def handle_authorization_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle the authorization code from the user."""
+    code = update.message.text.strip()
+    flow = context.user_data.get('flow')
+    if not flow:
+        await update.message.reply_text("❌ No active authorization session. Please send a link first.")
+        return
+
+    try:
+        flow.fetch_token(code=code)
+        with open(TOKEN_FILE, 'w') as token_file:
+            token_file.write(flow.credentials.to_json())
+        await update.message.reply_text("✅ Authorization successful! You can now send links.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Authorization failed. Please try again. Error: {str(e)}")
+        logger.error(f"Authorization error: {e}")
 
 async def download_youtube_video(url):
     """Download YouTube video using yt-dlp with cookies support."""
@@ -70,6 +103,8 @@ async def download_youtube_video(url):
 async def upload_to_google_drive(file_path, file_name):
     """Upload file to Google Drive."""
     creds = authorize_google_drive()
+    if not creds:
+        raise Exception("Google Drive authorization required.")
     service = build('drive', 'v3', credentials=creds)
     file_metadata = {'name': file_name}
     media = MediaFileUpload(file_path, resumable=True)
@@ -79,6 +114,12 @@ async def upload_to_google_drive(file_path, file_name):
 async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle YouTube link processing."""
     try:
+        # Check if Google Drive is authorized
+        creds = authorize_google_drive()
+        if not creds:
+            await start_authorization(update, context)
+            return
+
         # Download video
         await update.message.reply_text("🚀 Downloading video...")
         file_path, title = await download_youtube_video(update.message.text)
@@ -97,15 +138,31 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         if 'file_path' in locals() and os.path.exists(file_path):
             os.remove(file_path)
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all incoming messages."""
+    message_text = update.message.text.strip()
+
+    # Check if the message is an authorization code
+    if re.match(r'^\d+/\w+$', message_text):  # Example: 4/ABCdefGhIJKlmNoPQRstuVWXyz
+        await handle_authorization_code(update, context)
+    # Check if the message is a YouTube link
+    elif "youtube.com" in message_text or "youtu.be" in message_text:
+        await handle_youtube_link(update, context)
+    else:
+        await update.message.reply_text("⚠️ Please send a valid YouTube URL or authorization code.")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
-    await update.message.reply_text("Send a YouTube link to upload it to Google Drive.")
+    await update.message.reply_text(
+        "Send me a YouTube link to upload it to Google Drive!\n\n"
+        "If Google Drive is not authorized, I'll guide you through the process."
+    )
 
 def main():
     """Start the bot."""
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube_link))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.run_polling()
 
 if __name__ == '__main__':
