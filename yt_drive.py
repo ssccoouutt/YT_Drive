@@ -1,15 +1,68 @@
 import os
+import logging
 import requests
-from telegram import Update, InputFile
+from telegram import Update
 from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import Flow
+from google.auth.transport.requests import Request
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from dotenv import load_dotenv
 
-# Replace with your Telegram Bot Token
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+# Load environment variables
+load_dotenv()
+
+# Configuration
+SCOPES = ['https://www.googleapis.com/auth/drive']
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # From Railway environment
+GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')  # Base64 encoded credentials
+CLIENT_SECRET_FILE = 'credentials.json'  # Will be created from environment variable
+TOKEN_FILE = 'token.json'  # Will be stored in Railway's ephemeral storage
+
+# Initialize logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
+
+# Create credentials.json from environment variable
+if GOOGLE_CREDENTIALS and not os.path.exists(CLIENT_SECRET_FILE):
+    try:
+        with open(CLIENT_SECRET_FILE, 'w') as f:
+            f.write(base64.b64decode(GOOGLE_CREDENTIALS).decode())
+    except Exception as e:
+        logger.error(f"Failed to create credentials.json: {e}")
+        raise
+
+def authorize_google_drive():
+    """Authorize Google Drive API using OAuth2."""
+    creds = None
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+    return creds
+
+def upload_to_google_drive(file_path, file_name):
+    """Upload a file to Google Drive."""
+    creds = authorize_google_drive()
+    if not creds or not creds.valid:
+        raise Exception("Google Drive authorization failed.")
+
+    service = build('drive', 'v3', credentials=creds)
+    file_metadata = {'name': file_name}
+    media = MediaFileUpload(file_path, resumable=True)
+    file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
+    return file.get('id')
 
 def start(update: Update, context: CallbackContext) -> None:
-    update.message.reply_text("Send me a direct download link, and I'll upload it back to you!")
+    """Handler for the /start command."""
+    update.message.reply_text("Send me a direct download link, and I'll upload it to your Google Drive!")
 
 def handle_document_link(update: Update, context: CallbackContext) -> None:
+    """Handler for direct download links."""
     url = update.message.text
 
     # Validate the URL
@@ -30,9 +83,9 @@ def handle_document_link(update: Update, context: CallbackContext) -> None:
             for chunk in response.iter_content(chunk_size=8192):
                 file.write(chunk)
 
-        # Upload the file back to Telegram
-        with open(file_name, "rb") as file:
-            update.message.reply_document(document=InputFile(file))
+        # Upload the file to Google Drive
+        drive_file_id = upload_to_google_drive(file_name, file_name)
+        update.message.reply_text(f"File uploaded to Google Drive with ID: {drive_file_id}")
 
         # Clean up the temporary file
         os.remove(file_name)
@@ -41,6 +94,7 @@ def handle_document_link(update: Update, context: CallbackContext) -> None:
         update.message.reply_text(f"Failed to process the file. Error: {str(e)}")
 
 def main() -> None:
+    """Start the Telegram bot."""
     # Initialize the Telegram Bot
     updater = Updater(TELEGRAM_BOT_TOKEN)
 
