@@ -19,11 +19,11 @@ load_dotenv()
 
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/drive']
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # From Railway environment
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # From environment variable
 GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')  # Base64 encoded credentials
 CLIENT_SECRET_FILE = 'credentials.json'  # Created from environment variable
-TOKEN_FILE = 'token.json'  # Stored in Railway's ephemeral storage
-COOKIES_FILE = 'cookies.txt'  # Directly reference the file in the repository
+TOKEN_FILE = 'token.json'  # Stored in ephemeral storage
+COOKIES_FILE = 'cookies.txt'  # Optional cookies file for YouTube downloads
 
 # Initialize logging
 logging.basicConfig(
@@ -54,14 +54,14 @@ def authorize_google_drive():
     return creds
 
 async def download_youtube_video(url):
-    """Download YouTube video using yt-dlp."""
+    """Download a single YouTube video using yt-dlp."""
     ydl_opts = {
         'format': 'best',  # Best quality
         'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
         'quiet': True,  # Suppress output
     }
     
-    # Add cookies.txt if it exists in the repository
+    # Add cookies.txt if it exists
     if os.path.exists(COOKIES_FILE):
         ydl_opts['cookiefile'] = COOKIES_FILE
         logger.info("Using cookies.txt for YouTube download")
@@ -73,8 +73,31 @@ async def download_youtube_video(url):
         file_path = ydl.prepare_filename(info)
     return file_path, info['title']
 
+async def download_youtube_playlist(url):
+    """Download all videos from a YouTube playlist using yt-dlp."""
+    ydl_opts = {
+        'format': 'best',  # Best quality
+        'outtmpl': os.path.join(tempfile.gettempdir(), '%(playlist_index)s - %(title)s.%(ext)s'),
+        'quiet': True,  # Suppress output
+    }
+    
+    # Add cookies.txt if it exists
+    if os.path.exists(COOKIES_FILE):
+        ydl_opts['cookiefile'] = COOKIES_FILE
+        logger.info("Using cookies.txt for YouTube playlist download")
+    else:
+        logger.warning("cookies.txt not found. Proceeding without cookies.")
+
+    with YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        files = []
+        for entry in info['entries']:
+            file_path = ydl.prepare_filename(entry)
+            files.append((file_path, entry['title']))
+    return files
+
 async def upload_to_google_drive(file_path, file_name):
-    """Upload file to Google Drive."""
+    """Upload a file to Google Drive."""
     creds = authorize_google_drive()
     service = build('drive', 'v3', credentials=creds)
     file_metadata = {'name': file_name}
@@ -151,7 +174,7 @@ async def handle_direct_download_link(update: Update, context: ContextTypes.DEFA
         logger.error(f"Direct download error: {e}")
 
 async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle YouTube links."""
+    """Handle YouTube links (single video or playlist)."""
     url = update.message.text
 
     try:
@@ -163,19 +186,34 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     try:
-        await update.message.reply_text("⬇️ Downloading YouTube video...")
-        file_path, title = await download_youtube_video(url)
+        if "playlist" in url:
+            # Handle YouTube playlist
+            await update.message.reply_text("⬇️ Downloading YouTube playlist...")
+            files = await download_youtube_playlist(url)
 
-        await update.message.reply_text("⬆️ Uploading to Google Drive...")
-        drive_file_id = await upload_to_google_drive(file_path, f"{title}.mp4")
-
-        if drive_file_id:
-            await update.message.reply_text(f"✅ YouTube video uploaded to Google Drive with ID: {drive_file_id}")
+            for file_path, title in files:
+                await update.message.reply_text(f"⬆️ Uploading '{title}' to Google Drive...")
+                drive_file_id = await upload_to_google_drive(file_path, f"{title}.mp4")
+                if drive_file_id:
+                    await update.message.reply_text(f"✅ Uploaded '{title}' to Google Drive with ID: {drive_file_id}")
+                else:
+                    await update.message.reply_text(f"❌ Failed to upload '{title}' to Google Drive.")
+                os.remove(file_path)  # Clean up downloaded file
         else:
-            await update.message.reply_text("❌ Failed to upload to Google Drive.")
+            # Handle single YouTube video
+            await update.message.reply_text("⬇️ Downloading YouTube video...")
+            file_path, title = await download_youtube_video(url)
 
-        # Clean up downloaded file
-        os.remove(file_path)
+            await update.message.reply_text("⬆️ Uploading to Google Drive...")
+            drive_file_id = await upload_to_google_drive(file_path, f"{title}.mp4")
+
+            if drive_file_id:
+                await update.message.reply_text(f"✅ YouTube video uploaded to Google Drive with ID: {drive_file_id}")
+            else:
+                await update.message.reply_text("❌ Failed to upload to Google Drive.")
+
+            # Clean up downloaded file
+            os.remove(file_path)
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
         logger.error(f"YouTube download error: {e}")
@@ -199,7 +237,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     await update.message.reply_text(
-        "Send me a direct download link or a YouTube video link, and I'll upload it to your Google Drive!"
+        "Send me a direct download link or a YouTube video/playlist link, and I'll upload it to your Google Drive!"
     )
 
 def main():
