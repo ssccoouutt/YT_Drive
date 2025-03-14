@@ -6,7 +6,7 @@ import base64
 import requests
 import yt_dlp
 import asyncio
-from telegram import Update
+from telegram import Update, InputFile
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
@@ -122,6 +122,11 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
         else:
             await update.message.reply_text("❌ Failed to upload to Google Drive.")
 
+        # Send the video to Telegram
+        await message.edit_text("⬆️ Sending video to Telegram...")
+        with open(file_path, "rb") as video_file:
+            await update.message.reply_video(video=InputFile(video_file))
+
         # Clean up downloaded file
         os.remove(file_path)
     except Exception as e:
@@ -179,7 +184,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command."""
     await update.message.reply_text(
-        "Send me a direct download link or a YouTube video link, and I'll upload it to your Google Drive!"
+        "Send me a direct download link or a YouTube video link, and I'll upload it to your Google Drive and Telegram!"
     )
 
 def main():
