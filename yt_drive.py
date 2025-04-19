@@ -2,7 +2,6 @@ import os
 import logging
 import re
 import tempfile
-import base64
 import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -12,18 +11,15 @@ from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from yt_dlp import YoutubeDL
-from dotenv import load_dotenv
-
-# Load environment variables
-load_dotenv()
+from aiohttp import web
 
 # Configuration
 SCOPES = ['https://www.googleapis.com/auth/drive']
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN')  # From environment variable
-GOOGLE_CREDENTIALS = os.getenv('GOOGLE_CREDENTIALS')  # Base64 encoded credentials
-CLIENT_SECRET_FILE = 'credentials.json'  # Created from environment variable
-TOKEN_FILE = 'token.json'  # Stored in ephemeral storage
+TELEGRAM_BOT_TOKEN = "8080486871:AAECgE7E8cbkrBqFQdqLdtz89-7-v17u6qI"  # Hardcoded bot token
+CLIENT_SECRET_FILE = 'credentials.json'  # From GitHub repository
+TOKEN_FILE = 'token.json'  # Stored in Koyeb's temporary storage
 COOKIES_FILE = 'cookies.txt'  # Optional cookies file for YouTube downloads
+PORT = 8000  # Default port for Koyeb
 
 # Initialize logging
 logging.basicConfig(
@@ -32,14 +28,20 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Create credentials.json from environment variable
-if GOOGLE_CREDENTIALS and not os.path.exists(CLIENT_SECRET_FILE):
-    try:
-        with open(CLIENT_SECRET_FILE, 'w') as f:
-            f.write(base64.b64decode(GOOGLE_CREDENTIALS).decode())
-    except Exception as e:
-        logger.error(f"Failed to create credentials.json: {e}")
-        raise
+async def health_check(request):
+    """Health check endpoint for Koyeb"""
+    return web.Response(text="🤖 Bot is running")
+
+async def run_webserver():
+    """Run health check server for Koyeb"""
+    app = web.Application()
+    app.router.add_get('/', health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"✅ Health check server running on port {PORT}")
+    return runner
 
 def authorize_google_drive():
     """Authorize Google Drive API using OAuth2."""
@@ -56,17 +58,14 @@ def authorize_google_drive():
 async def download_youtube_video(url):
     """Download a single YouTube video using yt-dlp."""
     ydl_opts = {
-        'format': 'best',  # Best quality
+        'format': 'best',
         'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
-        'quiet': True,  # Suppress output
+        'quiet': True,
     }
     
-    # Add cookies.txt if it exists
     if os.path.exists(COOKIES_FILE):
         ydl_opts['cookiefile'] = COOKIES_FILE
         logger.info("Using cookies.txt for YouTube download")
-    else:
-        logger.warning("cookies.txt not found. Proceeding without cookies.")
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -76,17 +75,14 @@ async def download_youtube_video(url):
 async def download_youtube_playlist(url):
     """Download all videos from a YouTube playlist using yt-dlp."""
     ydl_opts = {
-        'format': 'best',  # Best quality
+        'format': 'best',
         'outtmpl': os.path.join(tempfile.gettempdir(), '%(playlist_index)s - %(title)s.%(ext)s'),
-        'quiet': True,  # Suppress output
+        'quiet': True,
     }
     
-    # Add cookies.txt if it exists
     if os.path.exists(COOKIES_FILE):
         ydl_opts['cookiefile'] = COOKIES_FILE
         logger.info("Using cookies.txt for YouTube playlist download")
-    else:
-        logger.warning("cookies.txt not found. Proceeding without cookies.")
 
     with YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
@@ -113,7 +109,7 @@ async def start_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE
         redirect_uri='urn:ietf:wg:oauth:2.0:oob'
     )
     auth_url, _ = flow.authorization_url(prompt='consent')
-    context.user_data['flow'] = flow  # Store the flow object in user_data
+    context.user_data['flow'] = flow
     await update.message.reply_text(
         f"🔑 Authorization required!\n\n"
         f"Please visit this link to authorize:\n{auth_url}\n\n"
@@ -142,31 +138,23 @@ async def handle_direct_download_link(update: Update, context: ContextTypes.DEFA
     url = update.message.text
 
     try:
-        # Check if Google Drive is authorized
         creds = authorize_google_drive()
     except Exception as e:
-        # If not authorized, start the OAuth2 flow
         await start_authorization(update, context)
         return
 
     try:
-        # Download the file
         response = requests.get(url, stream=True)
         response.raise_for_status()
 
-        # Get the file name from the URL or use a default name
         file_name = url.split("/")[-1] or "downloaded_file"
 
-        # Save the file temporarily
         with open(file_name, "wb") as file:
             for chunk in response.iter_content(chunk_size=8192):
                 file.write(chunk)
 
-        # Upload the file to Google Drive
         drive_file_id = await upload_to_google_drive(file_name, file_name)
         await update.message.reply_text(f"✅ File uploaded to Google Drive with ID: {drive_file_id}")
-
-        # Clean up the temporary file
         os.remove(file_name)
 
     except Exception as e:
@@ -178,16 +166,13 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
     url = update.message.text
 
     try:
-        # Check if Google Drive is authorized
         creds = authorize_google_drive()
     except Exception as e:
-        # If not authorized, start the OAuth2 flow
         await start_authorization(update, context)
         return
 
     try:
         if "playlist" in url:
-            # Handle YouTube playlist
             await update.message.reply_text("⬇️ Downloading YouTube playlist...")
             files = await download_youtube_playlist(url)
 
@@ -198,9 +183,8 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
                     await update.message.reply_text(f"✅ Uploaded '{title}' to Google Drive with ID: {drive_file_id}")
                 else:
                     await update.message.reply_text(f"❌ Failed to upload '{title}' to Google Drive.")
-                os.remove(file_path)  # Clean up downloaded file
+                os.remove(file_path)
         else:
-            # Handle single YouTube video
             await update.message.reply_text("⬇️ Downloading YouTube video...")
             file_path, title = await download_youtube_video(url)
 
@@ -212,7 +196,6 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
             else:
                 await update.message.reply_text("❌ Failed to upload to Google Drive.")
 
-            # Clean up downloaded file
             os.remove(file_path)
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
@@ -222,13 +205,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle all incoming messages."""
     message_text = update.message.text.strip()
 
-    # Check if the message is an authorization code
     if re.match(r'^[A-Za-z0-9_\-]+/[A-Za-z0-9_\-]+$', message_text):
         await handle_authorization_code(update, context)
-    # Check if the message is a YouTube link
     elif re.match(r'^(https?\:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+', message_text):
         await handle_youtube_link(update, context)
-    # Check if the message is a direct download link
     elif message_text.startswith(("http://", "https://")):
         await handle_direct_download_link(update, context)
     else:
@@ -240,12 +220,39 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Send me a direct download link or a YouTube video/playlist link, and I'll upload it to your Google Drive!"
     )
 
-def main():
-    """Start the bot."""
+async def run_bot():
+    """Run both the Telegram bot and web server."""
+    runner = await run_webserver()
+    
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.run_polling()
+    
+    await app.initialize()
+    await app.start()
+    logger.info("🤖 Telegram bot is running...")
+    
+    # Keep the application running
+    while True:
+        await asyncio.sleep(3600)
+
+async def main():
+    """Main entry point with proper cleanup."""
+    try:
+        await run_bot()
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")
+        raise
 
 if __name__ == '__main__':
-    main()
+    import asyncio
+    
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    try:
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        logger.info("\nBot stopped by user")
+    finally:
+        loop.close()
