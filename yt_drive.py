@@ -5,9 +5,9 @@ import tempfile
 import requests
 import asyncio
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, ConversationHandler
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import Flow
+from google_auth_oauthlib.flow import InstalledAppFlow
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
@@ -21,6 +21,10 @@ CLIENT_SECRET_FILE = 'credentials.json'
 TOKEN_FILE = 'token.json'
 COOKIES_FILE = 'cookies.txt'
 PORT = 8000
+
+# Authorization state
+AUTH_STATE = 1
+pending_authorizations = {}
 
 # Initialize logging
 logging.basicConfig(
@@ -43,17 +47,83 @@ async def run_webserver():
     logger.info(f"✅ Health check server running on port {PORT}")
     return runner
 
-def authorize_google_drive():
-    """Authorize Google Drive API"""
+async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start Google Drive authorization process"""
+    flow = InstalledAppFlow.from_client_secrets_file(
+        CREDENTIALS_PATH,
+        scopes=SCOPES,
+        redirect_uri='http://localhost:8080'
+    )
+    auth_url, _ = flow.authorization_url(prompt='consent')
+    pending_authorizations[update.effective_user.id] = flow
+    
+    await update.message.reply_text(
+        "🔑 *Google Drive Authorization Required*\n\n"
+        "1. Click this link to authorize:\n"
+        f"[Authorize Google Drive]({auth_url})\n\n"
+        "2. After approving, you'll see an error page (This is normal)\n"
+        "3. Send me the complete URL from your browser's address bar\n\n"
+        "⚠️ *Note:* You may see an 'unverified app' warning. Click 'Advanced' then 'Continue'",
+        parse_mode='Markdown',
+        disable_web_page_preview=True
+    )
+    return AUTH_STATE
+
+async def handle_auth_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle received authorization code"""
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    
+    # Extract code from URL
+    code = None
+    if 'code=' in text:
+        code = text.split('code=')[1].split('&')[0]
+    elif 'localhost' in text and '?code=' in text:
+        code = text.split('?code=')[1].split('&')[0]
+    
+    if not code or user_id not in pending_authorizations:
+        await update.message.reply_text("❌ Invalid authorization URL. Please try /auth again")
+        return ConversationHandler.END
+    
+    try:
+        flow = pending_authorizations[user_id]
+        flow.fetch_token(code=code)
+        creds = flow.credentials
+        
+        with open(TOKEN_FILE, 'w') as token_file:
+            token_file.write(creds.to_json())
+        
+        del pending_authorizations[user_id]
+        await update.message.reply_text("✅ Authorization successful! Bot is now ready to use.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Authorization failed: {str(e)}")
+    
+    return ConversationHandler.END
+
+async def cancel_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel authorization process"""
+    user_id = update.effective_user.id
+    if user_id in pending_authorizations:
+        del pending_authorizations[user_id]
+    
+    await update.message.reply_text("❌ Authorization cancelled")
+    return ConversationHandler.END
+
+def get_drive_service():
+    """Get authorized Drive service"""
     creds = None
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             creds.refresh(Request())
+            with open(TOKEN_FILE, 'w') as token:
+                token.write(creds.to_json())
         else:
-            raise Exception("Google Drive authorization required.")
-    return creds
+            raise Exception('Google Drive authorization required. Use /auth to authenticate.')
+    
+    return build('drive', 'v3', credentials=creds)
 
 async def download_youtube_video(url):
     """Download YouTube video"""
@@ -73,50 +143,18 @@ async def download_youtube_video(url):
 
 async def upload_to_google_drive(file_path, file_name):
     """Upload file to Google Drive"""
-    creds = authorize_google_drive()
-    service = build('drive', 'v3', credentials=creds)
+    service = get_drive_service()
     file_metadata = {'name': file_name}
     media = MediaFileUpload(file_path, resumable=True)
     file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
     return file.get('id')
 
-async def start_authorization(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Start OAuth2 flow"""
-    flow = Flow.from_client_secrets_file(
-        CLIENT_SECRET_FILE,
-        scopes=SCOPES,
-        redirect_uri='urn:ietf:wg:oauth:2.0:oob'
-    )
-    auth_url, _ = flow.authorization_url(prompt='consent')
-    context.user_data['flow'] = flow
-    await update.message.reply_text(
-        f"🔑 Authorization required!\n\n"
-        f"Please visit this link to authorize:\n{auth_url}\n\n"
-        "After authorization, send the code you receive back here."
-    )
-
-async def handle_authorization_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle authorization code"""
-    code = update.message.text.strip()
-    flow = context.user_data.get('flow')
-    if not flow:
-        await update.message.reply_text("❌ No active authorization session")
-        return
-
-    try:
-        flow.fetch_token(code=code)
-        with open(TOKEN_FILE, 'w') as token_file:
-            token_file.write(flow.credentials.to_json())
-        await update.message.reply_text("✅ Authorization successful!")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Authorization failed: {str(e)}")
-
 async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle YouTube links"""
     try:
-        authorize_google_drive()  # Check auth first
-    except Exception:
-        await start_authorization(update, context)
+        get_drive_service()  # Check auth first
+    except Exception as e:
+        await update.message.reply_text("🔑 Please authorize first using /auth")
         return
 
     url = update.message.text
@@ -132,23 +170,11 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle all messages"""
-    text = update.message.text.strip()
-    
-    if re.match(r'^[A-Za-z0-9_\-]+/[A-Za-z0-9_\-]+$', text):
-        await handle_authorization_code(update, context)
-    elif re.match(r'^(https?\:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+', text):
-        await handle_youtube_link(update, context)
-    elif text.startswith(("http://", "https://")):
-        await handle_direct_download_link(update, context)
-    else:
-        await update.message.reply_text("⚠️ Please send a YouTube URL or direct download link")
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     await update.message.reply_text(
-        "Send me a YouTube link or direct download link to upload to Google Drive!"
+        "Send me a YouTube link to upload to Google Drive!\n"
+        "First, authorize with /auth"
     )
 
 async def run_bot():
@@ -156,8 +182,19 @@ async def run_bot():
     runner = await run_webserver()
     
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    
+    # Add conversation handler for auth flow
+    auth_conv = ConversationHandler(
+        entry_points=[CommandHandler("auth", auth_command)],
+        states={
+            AUTH_STATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_auth_code)]
+        },
+        fallbacks=[CommandHandler("cancel", cancel_auth)]
+    )
+    
+    app.add_handler(auth_conv)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube_link))
     
     await app.initialize()
     await app.start()
