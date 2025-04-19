@@ -1,1 +1,1 @@
-worker: python yt_drive.py
+web: python yt_drive.py
