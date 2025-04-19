@@ -49,43 +49,47 @@ async def run_webserver():
 
 async def auth_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start Google Drive authorization process"""
-    flow = InstalledAppFlow.from_client_secrets_file(
-        CREDENTIALS_PATH,
-        scopes=SCOPES,
-        redirect_uri='http://localhost:8080'
-    )
-    auth_url, _ = flow.authorization_url(prompt='consent')
-    pending_authorizations[update.effective_user.id] = flow
-    
-    await update.message.reply_text(
-        "🔑 *Google Drive Authorization Required*\n\n"
-        "1. Click this link to authorize:\n"
-        f"[Authorize Google Drive]({auth_url})\n\n"
-        "2. After approving, you'll see an error page (This is normal)\n"
-        "3. Send me the complete URL from your browser's address bar\n\n"
-        "⚠️ *Note:* You may see an 'unverified app' warning. Click 'Advanced' then 'Continue'",
-        parse_mode='Markdown',
-        disable_web_page_preview=True
-    )
-    return AUTH_STATE
+    try:
+        flow = InstalledAppFlow.from_client_secrets_file(
+            CLIENT_SECRET_FILE,
+            scopes=SCOPES,
+            redirect_uri='http://localhost:8080'
+        )
+        auth_url, _ = flow.authorization_url(prompt='consent')
+        pending_authorizations[update.effective_user.id] = flow
+        
+        await update.message.reply_text(
+            "🔑 *Google Drive Authorization Required*\n\n"
+            "1. Click this link to authorize:\n"
+            f"{auth_url}\n\n"
+            "2. After approving, you'll see an error page (This is normal)\n"
+            "3. Copy the ENTIRE URL from your browser's address bar\n"
+            "4. Send it back to me exactly as you see it\n\n"
+            "⚠️ *Note:* You may need to click 'Advanced' then 'Continue' if you see a warning",
+            parse_mode='Markdown',
+            disable_web_page_preview=True
+        )
+        return AUTH_STATE
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to start authorization: {str(e)}")
+        return ConversationHandler.END
 
 async def handle_auth_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle received authorization code"""
+    """Handle received authorization URL"""
     user_id = update.effective_user.id
     text = update.message.text.strip()
     
+    # Check if this is a localhost URL
+    if 'localhost' not in text or 'code=' not in text:
+        await update.message.reply_text("❌ That doesn't look like an authorization URL. Please send the exact URL from your browser after authorizing.")
+        return AUTH_STATE
+    
     # Extract code from URL
-    code = None
-    if 'code=' in text:
-        code = text.split('code=')[1].split('&')[0]
-    elif 'localhost' in text and '?code=' in text:
-        code = text.split('?code=')[1].split('&')[0]
-    
-    if not code or user_id not in pending_authorizations:
-        await update.message.reply_text("❌ Invalid authorization URL. Please try /auth again")
-        return ConversationHandler.END
-    
     try:
+        code = text.split('code=')[1].split('&')[0]
+        if not code or user_id not in pending_authorizations:
+            raise ValueError("Invalid authorization code")
+            
         flow = pending_authorizations[user_id]
         flow.fetch_token(code=code)
         creds = flow.credentials
@@ -94,18 +98,17 @@ async def handle_auth_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
             token_file.write(creds.to_json())
         
         del pending_authorizations[user_id]
-        await update.message.reply_text("✅ Authorization successful! Bot is now ready to use.")
+        await update.message.reply_text("✅ Authorization successful! You can now send YouTube links.")
+        return ConversationHandler.END
     except Exception as e:
-        await update.message.reply_text(f"❌ Authorization failed: {str(e)}")
-    
-    return ConversationHandler.END
+        await update.message.reply_text(f"❌ Authorization failed: {str(e)}\n\nPlease try /auth again.")
+        return ConversationHandler.END
 
 async def cancel_auth(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel authorization process"""
     user_id = update.effective_user.id
     if user_id in pending_authorizations:
         del pending_authorizations[user_id]
-    
     await update.message.reply_text("❌ Authorization cancelled")
     return ConversationHandler.END
 
@@ -122,7 +125,6 @@ def get_drive_service():
                 token.write(creds.to_json())
         else:
             raise Exception('Google Drive authorization required. Use /auth to authenticate.')
-    
     return build('drive', 'v3', credentials=creds)
 
 async def download_youtube_video(url):
@@ -132,7 +134,6 @@ async def download_youtube_video(url):
         'outtmpl': os.path.join(tempfile.gettempdir(), '%(title)s.%(ext)s'),
         'quiet': True,
     }
-    
     if os.path.exists(COOKIES_FILE):
         ydl_opts['cookiefile'] = COOKIES_FILE
 
@@ -170,11 +171,22 @@ async def handle_youtube_link(update: Update, context: ContextTypes.DEFAULT_TYPE
     except Exception as e:
         await update.message.reply_text(f"❌ Error: {str(e)}")
 
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle all messages"""
+    text = update.message.text.strip()
+    
+    # Check if it's a YouTube link
+    if re.match(r'^(https?\:\/\/)?(www\.)?(youtube\.com|youtu\.?be)\/.+', text):
+        await handle_youtube_link(update, context)
+    else:
+        await update.message.reply_text("Please send a YouTube link or use /auth to authorize")
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command"""
     await update.message.reply_text(
-        "Send me a YouTube link to upload to Google Drive!\n"
-        "First, authorize with /auth"
+        "Welcome to YouTube to Google Drive Uploader!\n\n"
+        "1. First, authorize with /auth\n"
+        "2. Then send me any YouTube link to upload to your Google Drive"
     )
 
 async def run_bot():
@@ -194,7 +206,7 @@ async def run_bot():
     
     app.add_handler(auth_conv)
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube_link))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     await app.initialize()
     await app.start()
