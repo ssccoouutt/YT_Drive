@@ -13,6 +13,7 @@ from telegram.ext import (
     CallbackQueryHandler
 )
 from yt_dlp import YoutubeDL
+from aiohttp import web  # Added missing import
 
 # Configuration
 TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "7686548563:AAF--QqIloUPkIwUHbvkWcD4adS1iJuTqXE")
@@ -159,20 +160,20 @@ async def run_webserver():
     logger.info(f"Health check running on port {PORT}")
     return runner
 
-async def run_bot():
+async def main():
     # Start webserver for Railway health checks
     runner = await run_webserver()
     
     # Start Telegram bot
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    bot = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
     
     # Add handlers
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube_link))
-    app.add_handler(CallbackQueryHandler(handle_resolution_selection))
+    bot.add_handler(CommandHandler("start", start))
+    bot.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_youtube_link))
+    bot.add_handler(CallbackQueryHandler(handle_resolution_selection))
     
-    await app.initialize()
-    await app.start()
+    await bot.initialize()
+    await bot.start()
     logger.info("Bot is running and ready")
     
     # Keep running
@@ -185,6 +186,6 @@ if __name__ == '__main__':
         if not os.path.exists(COOKIES_FILE):
             logger.warning("⚠️ cookies.txt not found! Some videos may not download without it")
         
-        asyncio.run(run_bot())
+        asyncio.run(main())
     except Exception as e:
         logger.error(f"Bot crashed: {str(e)}")
