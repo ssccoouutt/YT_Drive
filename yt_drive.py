@@ -16,7 +16,7 @@ from yt_dlp import YoutubeDL
 from aiohttp import web  # Added missing import
 
 # Configuration
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "7686548563:AAF--QqIloUPkIwUHbvkWcD4adS1iJuTqXE")
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', "7966314098:AAEuW6yHTblcJXhG3AA915_geQtju4ck37c")
 COOKIES_FILE = os.getenv('COOKIES_FILE', 'cookies.txt')  # Optional for restricted videos
 PORT = int(os.getenv('PORT', 8000))
 
